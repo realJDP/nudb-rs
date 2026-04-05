@@ -227,6 +227,110 @@ impl Store {
         Ok(None)
     }
 
+    /// Insert or update a key-value pair. Always succeeds.
+    /// If the key exists, the old value becomes dead space in the data file
+    /// (reclaimed during database rotation, like rippled's online_delete).
+    pub fn upsert(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        assert_eq!(key.len(), self.header.key_size as usize);
+
+        let hash = xxh64(key, self.header.salt);
+        let hash48 = hash & 0xFFFF_FFFF_FFFF;
+        let bucket_idx = self.bucket_index(hash);
+        let mut bucket = self.read_bucket(bucket_idx)?;
+
+        // Append new record to data file
+        let dat_offset = self.dat_file.seek(SeekFrom::End(0))?;
+        let record_size = (self.header.key_size as u64) + (value.len() as u64);
+        self.dat_file.write_all(&write_u48(record_size))?;
+        self.dat_file.write_all(key)?;
+        self.dat_file.write_all(value)?;
+
+        // Check if key already exists in bucket — update offset if so
+        let mut found = false;
+        for entry in &mut bucket.entries {
+            if entry.hash == hash48 {
+                // Verify full key match
+                let (found_key, _) = self.read_record(entry.offset)?;
+                if found_key == key {
+                    entry.offset = dat_offset;
+                    entry.size = value.len() as u64;
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        // Check spill chain too
+        if !found {
+            let mut spill_offset = bucket.spill;
+            while spill_offset != 0 && !found {
+                let (mut spill_bucket, next_spill) = self.read_spill(spill_offset)?;
+                for entry in &mut spill_bucket.entries {
+                    if entry.hash == hash48 {
+                        let (found_key, _) = self.read_record(entry.offset)?;
+                        if found_key == key {
+                            entry.offset = dat_offset;
+                            entry.size = value.len() as u64;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if found {
+                    // Rewrite the spill bucket with updated offset
+                    let block_size = self.header.block_size as usize;
+                    let spill_bytes = spill_bucket.to_bytes(block_size);
+                    self.dat_file.seek(SeekFrom::Start(spill_offset + 8))?;
+                    self.dat_file.write_all(&spill_bytes)?;
+                }
+                spill_offset = next_spill;
+            }
+        }
+
+        if found {
+            self.write_bucket(bucket_idx, &bucket)?;
+        } else {
+            // New key — insert
+            let capacity = self.header.bucket_capacity();
+            if bucket.entries.len() >= capacity {
+                self.spill_bucket(&mut bucket)?;
+            }
+            bucket.insert(BucketEntry {
+                offset: dat_offset,
+                size: value.len() as u64,
+                hash: hash48,
+            });
+            self.write_bucket(bucket_idx, &bucket)?;
+            self.header.key_count += 1;
+            self.write_key_header()?;
+            self.maybe_split()?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove a key. Marks the bucket entry as removed.
+    /// The data stays in the data file (append-only) but the key is no longer findable.
+    pub fn remove(&mut self, key: &[u8]) -> io::Result<bool> {
+        assert_eq!(key.len(), self.header.key_size as usize);
+
+        let hash = xxh64(key, self.header.salt);
+        let hash48 = hash & 0xFFFF_FFFF_FFFF;
+        let bucket_idx = self.bucket_index(hash);
+        let mut bucket = self.read_bucket(bucket_idx)?;
+
+        let before = bucket.entries.len();
+        bucket.entries.retain(|e| e.hash != hash48);
+        if bucket.entries.len() < before {
+            bucket.count = bucket.entries.len() as u16;
+            self.write_bucket(bucket_idx, &bucket)?;
+            self.header.key_count = self.header.key_count.saturating_sub(1);
+            self.write_key_header()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Check if a key exists without reading the value.
     pub fn exists(&mut self, key: &[u8]) -> io::Result<bool> {
         Ok(self.fetch(key)?.is_some())
@@ -563,6 +667,73 @@ mod tests {
                 key[..4].copy_from_slice(&i.to_le_bytes());
                 assert!(store.fetch(&key).unwrap().is_some(), "key {i} missing after reopen");
             }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_updates_value() {
+        let dir = temp_dir();
+        let mut store = Store::create(&dir, StoreOptions::default()).unwrap();
+
+        let key = [0x01; 32];
+        store.upsert(&key, b"version1").unwrap();
+        assert_eq!(store.fetch(&key).unwrap().unwrap(), b"version1");
+
+        store.upsert(&key, b"version2").unwrap();
+        assert_eq!(store.fetch(&key).unwrap().unwrap(), b"version2");
+
+        // Key count should still be 1 (update, not new insert)
+        assert_eq!(store.key_count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_key() {
+        let dir = temp_dir();
+        let mut store = Store::create(&dir, StoreOptions::default()).unwrap();
+
+        let key = [0x02; 32];
+        store.insert(&key, b"data").unwrap();
+        assert!(store.exists(&key).unwrap());
+
+        assert!(store.remove(&key).unwrap());
+        assert!(!store.exists(&key).unwrap());
+        assert_eq!(store.key_count(), 0);
+
+        // Remove non-existent
+        assert!(!store.remove(&key).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_many() {
+        let dir = temp_dir();
+        let mut store = Store::create(&dir, StoreOptions::default()).unwrap();
+
+        // Insert 500 keys
+        for i in 0u32..500 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_le_bytes());
+            store.upsert(&key, &i.to_le_bytes()).unwrap();
+        }
+        assert_eq!(store.key_count(), 500);
+
+        // Update all 500
+        for i in 0u32..500 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_le_bytes());
+            let new_val = (i * 100).to_le_bytes();
+            store.upsert(&key, &new_val).unwrap();
+        }
+        assert_eq!(store.key_count(), 500); // Still 500, not 1000
+
+        // Verify updated values
+        for i in 0u32..500 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_le_bytes());
+            let val = store.fetch(&key).unwrap().unwrap();
+            assert_eq!(val, (i * 100).to_le_bytes());
         }
         std::fs::remove_dir_all(&dir).ok();
     }
