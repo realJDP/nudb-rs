@@ -57,6 +57,7 @@ pub struct Store {
     threshold: usize,
     frac: usize,
     pending: BTreeMap<Vec<u8>, Pending>,
+    record_count: u64,
 }
 
 impl Store {
@@ -148,6 +149,11 @@ impl Store {
         let threshold = (key_header.load_factor * key_header.capacity).max(65_536);
         let buckets = key_header.buckets;
         let modulus = key_header.modulus;
+        let mut record_count = 0u64;
+        visit_dat_records(&mut dat, key_header.key_size, |_, _| {
+            record_count = record_count.saturating_add(1);
+            Ok(())
+        })?;
 
         Ok(Self {
             dat_path,
@@ -162,6 +168,7 @@ impl Store {
             threshold,
             frac: threshold / 2,
             pending: BTreeMap::new(),
+            record_count,
         })
     }
 
@@ -189,6 +196,10 @@ impl Store {
         self.header.block_size
     }
 
+    pub fn key_count(&self) -> u64 {
+        self.record_count
+    }
+
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_key(key)?;
         if value.is_empty() {
@@ -208,6 +219,7 @@ impl Store {
                 value: value.to_vec(),
             },
         );
+        self.record_count = self.record_count.saturating_add(1);
         Ok(())
     }
 

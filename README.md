@@ -2,9 +2,9 @@
 
 A compatibility-first Rust port of NuDB.
 
-This project treats upstream C++ NuDB as the oracle. The goal is not a
+This project treats upstream C++ NuDB as the format oracle. The goal is not a
 NuDB-inspired store; it is byte-compatible `.dat`, `.key`, and `.log` handling
-with tests that prove interoperability in both directions.
+with deterministic Rust tests for the on-disk layout and recovery behavior.
 
 The implementation follows the upstream C++ NuDB layout:
 
@@ -21,19 +21,20 @@ Current API:
 - fetch by key
 - flush/close
 - visit the data file
+- count keys
 - verify that all data-file values are reachable through the key file
 - recover from a present NuDB log file on open
 
 ## Compatibility Status
 
-Proven by tests:
+Covered by the Rust test suite:
 
 - Rust creates, inserts, fetches, flushes, reopens, visits, and verifies stores
 - deterministic 2,500-record stress with many flushes
+- duplicate-key rejection
 - rollback recovery from a present log header
 - rollback recovery restoring a logged key bucket after deliberate key-file corruption
-- C++ NuDB writes a 2,000-record fixture and Rust reads/verifies it
-- Rust writes a 2,000-record fixture with periodic flushes and C++ NuDB reads it
+- NuDB field encoding and upper-48-bit hash reduction
 
 Still intentionally future work:
 
@@ -43,9 +44,6 @@ Still intentionally future work:
 - very large multi-million-record soak runs
 - real rippled node-store fixtures
 
-The on-disk format and core algorithms are now covered by both native Rust tests
-and upstream C++ oracle tests.
-
 ## Testing
 
 Run the Rust tests:
@@ -53,25 +51,6 @@ Run the Rust tests:
 ```sh
 cargo test
 ```
-
-Run the upstream C++ oracle tests when NuDB headers are available:
-
-```sh
-NUDB_CPP_INCLUDE=/path/to/NuDB/include cargo test --test cpp_compat -- --ignored
-```
-
-On Homebrew macOS, Boost is found automatically under `/opt/homebrew`. Override
-with `BOOST_INCLUDE` and `BOOST_LIB` when needed:
-
-```sh
-BOOST_INCLUDE=/path/to/include \
-BOOST_LIB=/path/to/lib \
-NUDB_CPP_INCLUDE=/path/to/NuDB/include \
-cargo test --test cpp_compat -- --ignored
-```
-
-The oracle suite tests both directions: C++ writes/Rust reads and Rust
-writes/C++ reads.
 
 ## Example
 
@@ -92,4 +71,3 @@ store.flush()?;
 assert_eq!(store.fetch(&key_bytes)?, b"value");
 # Ok::<(), nudb_rs::Error>(())
 ```
-
